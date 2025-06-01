@@ -2,7 +2,6 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Video Conference - Join</title>
   <link rel="stylesheet" href="css/style.css">
 </head>
@@ -17,11 +16,11 @@
       </select><br>
       <label for="userName">Name:</label>
       <input type="text" id="userName" placeholder="Enter your name" required><br>
-      <label for="sessionId">Session ID (required for students):</label>
+      <label for="sessionId">Session ID (optional for teachers):</label>
       <input type="text" id="sessionId" placeholder="Enter session ID"><br>
       <button type="submit">Join/Create Session</button>
     </form>
-    <p id="status" class=""></p>
+    <p id="status" class="error"></p>
   </div>
   
   <!-- Fixed CDN URLs -->
