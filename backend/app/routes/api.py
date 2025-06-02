@@ -1,4 +1,5 @@
 from flask import Flask, jsonify, request, Blueprint
+from flask_socketio import SocketIO, emit, join_room, leave_room
 import uuid
 from datetime import datetime
 import logging
@@ -8,7 +9,7 @@ from sqlalchemy.exc import SQLAlchemyError, OperationalError
 from app.models.models import Session, User, Message
 from config import Config
 import traceback
-import requests  # Added for mediasoup server communication
+import requests
 import pytz
 
 logger = logging.getLogger(__name__)
@@ -16,11 +17,15 @@ logger = logging.getLogger(__name__)
 # Create Blueprint
 api_bp = Blueprint('api', __name__)
 
-#Mediasoup server URL
-MEDIASOUP_SERVER_URL = Config.MEDIASOUP_SERVER_URL
+# Initialize SocketIO (will be attached in run.py)
+socketio = SocketIO(cors_allowed_origins="http://127.0.0.1:8000")
+
+# Mediasoup server URL
+MEDIASOUP_SERVER_URL = "http://127.0.0.1:3000"
 
 def register_api_routes(app):
     app.register_blueprint(api_bp)
+    socketio.init_app(app)
 
 def handle_db_error(error, operation):
     """Handle database errors consistently"""
@@ -60,6 +65,18 @@ def health_check():
             'error': str(e),
             'timestamp': datetime.now(pytz.UTC).isoformat()
         }), 503
+
+@api_bp.route('/api/router-capabilities', methods=['GET'])
+def router_capabilities():
+    """Fetch mediasoup router RTP capabilities"""
+    try:
+        response = requests.get(f"{MEDIASOUP_SERVER_URL}/router-capabilities")
+        if response.status_code != 200:
+            raise Exception("Failed to fetch router capabilities")
+        return jsonify(response.json())
+    except Exception as e:
+        logger.error(f"Error fetching router capabilities: {str(e)}")
+        return jsonify({'error': str(e), 'success': False}), 500
 
 @api_bp.route('/api/create-session', methods=['POST'])
 def create_session():
@@ -156,6 +173,23 @@ def join_session():
                 
                 session.add_participant(user)
                 
+                # If the joining user is a teacher, reset the livestream state
+                if is_teacher:
+                    if session.is_livestreaming:
+                        # Check if the producer is still active on mediasoup server
+                        if session.producer_id:
+                            try:
+                                response = requests.post(f"{MEDIASOUP_SERVER_URL}/closeProducer", json={
+                                    'producerId': session.producer_id
+                                })
+                                if response.status_code == 200:
+                                    logger.info(f"Closed stale producer {session.producer_id} for session {session_id}")
+                                    socketio.emit('producerClosed', {'producerId': session.producer_id}, room=session_id)
+                            except Exception as e:
+                                logger.error(f"Error closing stale producer: {str(e)}")
+                        session.stop_livestream()  # Reset the livestream state
+                        logger.info(f"Reset livestream state for session {session_id} as teacher rejoined")
+                
                 db_session.commit()
                 
                 db_session.refresh(session)
@@ -164,6 +198,13 @@ def join_session():
                 messages = [msg.to_dict() for msg in session.messages]
                 
                 logger.info(f"User {user_id} ({user_name}) joined session {session_id}")
+                
+                # Emit user_joined event to all clients in the session
+                socketio.emit('user_joined', {
+                    'userId': user_id,
+                    'name': user_name,
+                    'isTeacher': is_teacher
+                }, room=session_id)
                 
                 return jsonify({
                     'sessionId': session_id,
@@ -232,12 +273,21 @@ def leave_session():
                         })
                         if response.status_code != 200:
                             logger.error(f"Failed to close producer {session.producer_id} on mediasoup server")
+                        else:
+                            socketio.emit('producerClosed', {'producerId': session.producer_id}, room=session_id)
                     except Exception as e:
                         logger.error(f"Error closing producer on mediasoup server: {str(e)}")
+                
+                # Ensure teacher's livestream state is reset
+                if user.is_teacher:
+                    user.is_streaming = False
                 
                 db_session.commit()
                 
                 logger.info(f"User {user_id} left session {session_id}")
+                
+                # Emit user_left event
+                socketio.emit('user_left', {'userId': user_id}, room=session_id)
                 
                 return jsonify({'success': True})
         
@@ -274,6 +324,12 @@ def raise_hand():
                 
                 user.hand_raised = is_raised
                 db_session.commit()
+                
+                # Emit hand_raised event
+                socketio.emit('hand_raised', {
+                    'userId': user_id,
+                    'isRaised': is_raised
+                }, room=session_id)
                 
                 return jsonify({'success': True})
         
@@ -330,9 +386,14 @@ def send_message():
                 db_session.add(message)
                 db_session.commit()
                 
+                message_dict = message.to_dict()
+                
+                # Emit new_message event
+                socketio.emit('new_message', message_dict, room=session_id)
+                
                 return jsonify({
                     'success': True,
-                    'message': message.to_dict()
+                    'message': message_dict
                 })
         
         except SQLAlchemyError as e:
@@ -368,7 +429,20 @@ def start_livestream():
                     return jsonify({'error': 'Only teachers can start livestream', 'success': False}), 403
                 
                 if session.is_livestreaming:
-                    return jsonify({'error': 'Livestream is already active', 'success': False}), 400
+                    # Check if the producer is still active on mediasoup server
+                    if session.producer_id:
+                        try:
+                            response = requests.post(f"{MEDIASOUP_SERVER_URL}/closeProducer", json={
+                                'producerId': session.producer_id
+                            })
+                            if response.status_code == 200:
+                                logger.info(f"Closed stale producer {session.producer_id} for session {session_id}")
+                                socketio.emit('producerClosed', {'producerId': session.producer_id}, room=session_id)
+                            session.producer_id = None  # Clear the producer ID
+                        except Exception as e:
+                            logger.error(f"Error closing stale producer: {str(e)}")
+                    session.stop_livestream()  # Reset the livestream state
+                    logger.info(f"Reset livestream state for session {session_id} to allow new stream")
                 
                 session.start_livestream()
                 user.is_streaming = True
@@ -379,6 +453,9 @@ def start_livestream():
                 db_session.commit()
                 
                 logger.info(f"Livestream started in session {session_id} by teacher {user_id}")
+                
+                # Emit livestream_started event
+                socketio.emit('livestream_started', {}, room=session_id)
                 
                 return jsonify({'success': True})
         
@@ -421,7 +498,7 @@ def stop_livestream():
                 session.stop_livestream()
                 user.is_streaming = False
                 
-                effective_producer_id = session.producer_id or producer_id
+                effective_producer_id = producer_id or session.producer_id
                 if effective_producer_id:
                     try:
                         response = requests.post(f"{MEDIASOUP_SERVER_URL}/closeProducer", json={
@@ -429,12 +506,19 @@ def stop_livestream():
                         })
                         if response.status_code != 200:
                             logger.error(f"Failed to close producer {effective_producer_id} on mediasoup server")
+                        else:
+                            socketio.emit('producerClosed', {'producerId': effective_producer_id}, room=session_id)
                     except Exception as e:
                         logger.error(f"Error closing producer on mediasoup server: {str(e)}")
+                
+                session.producer_id = None  # Clear the producer ID
                 
                 db_session.commit()
                 
                 logger.info(f"Livestream stopped in session {session_id} by teacher {user_id}")
+                
+                # Emit livestream_ended event
+                socketio.emit('livestream_ended', {}, room=session_id)
                 
                 return jsonify({'success': True})
         
@@ -472,6 +556,9 @@ def mark_question_answered():
                 
                 message.answered = True
                 db_session.commit()
+                
+                # Emit question_answered event
+                socketio.emit('question_answered', {'messageId': message_id}, room=session_id)
                 
                 return jsonify({'success': True})
         
@@ -520,3 +607,102 @@ def get_active_sessions():
     except Exception as e:
         logger.error(f"Unexpected error in get_active_sessions: {str(e)}")
         return jsonify({'error': 'Internal server error', 'success': False}), 500
+
+# SocketIO event handlers
+@socketio.on('join')
+def handle_join(data):
+    session_id = data.get('sessionId')
+    user_id = data.get('userId')
+    if session_id and user_id:
+        join_room(session_id)
+        logger.info(f"User {user_id} joined SocketIO room {session_id}")
+
+@socketio.on('leave')
+def handle_leave(data):
+    session_id = data.get('sessionId')
+    user_id = data.get('userId')
+    if session_id and user_id:
+        leave_room(session_id)
+        logger.info(f"User {user_id} left SocketIO room {session_id}")
+
+# ... (previous code remains unchanged)
+
+@socketio.on('createProducerTransport')
+def handle_create_producer_transport(data=None, callback=None):
+    try:
+        response = requests.post(f"{MEDIASOUP_SERVER_URL}/createProducerTransport").json()
+        if callback:
+            callback(response)
+    except Exception as e:
+        logger.error(f"Error creating producer transport: {str(e)}")
+        if callback:
+            callback({'error': str(e)})
+
+@socketio.on('createConsumerTransport')
+def handle_create_consumer_transport(data=None, callback=None):
+    try:
+        response = requests.post(f"{MEDIASOUP_SERVER_URL}/createConsumerTransport").json()
+        if callback:
+            callback(response)
+    except Exception as e:
+        logger.error(f"Error creating consumer transport: {str(e)}")
+        if callback:
+            callback({'error': str(e)})
+
+# ... (rest of the code remains unchanged)
+
+@socketio.on('connectTransport')
+def handle_connect_transport(data, callback):
+    try:
+        response = requests.post(f"{MEDIASOUP_SERVER_URL}/connectTransport", json=data).json()
+        if 'error' in response:
+            callback({'error': response['error']})
+        else:
+            callback({'success': True})
+    except Exception as e:
+        logger.error(f"Error connecting transport: {str(e)}")
+        callback({'error': str(e)})
+
+@socketio.on('produce')
+def handle_produce(data, callback):
+    session_id = data.get('sessionId')
+    kind = data.get('kind')
+    user_id = data.get('userId')
+    try:
+        response = requests.post(f"{MEDIASOUP_SERVER_URL}/produce", json={
+            'transportId': data['transportId'],
+            'kind': kind,
+            'rtpParameters': data['rtpParameters']
+        }).json()
+        if 'error' in response:
+            callback({'error': response['error']})
+        else:
+            producer_id = response['id']
+            # Update session with producer ID
+            with SQLSession(Config.engine) as db_session:
+                session = db_session.query(Session).filter_by(session_id=session_id).first()
+                if session:
+                    session.producer_id = producer_id
+                    db_session.commit()
+            # Notify other clients
+            socketio.emit('newProducer', {
+                'producerId': producer_id,
+                'kind': kind,
+                'userId': user_id
+            }, room=session_id)
+            callback({'id': producer_id})
+    except Exception as e:
+        logger.error(f"Error producing: {str(e)}")
+        callback({'error': str(e)})
+
+@socketio.on('consume')
+def handle_consume(data, callback):
+    try:
+        response = requests.post(f"{MEDIASOUP_SERVER_URL}/consume", json=data).json()
+        if 'error' in response:
+            callback({'error': response['error']})
+        else:
+            callback(response)
+    except Exception as e:
+        logger.error(f"Error consuming: {str(e)}")
+        callback({'error': str(e)})
